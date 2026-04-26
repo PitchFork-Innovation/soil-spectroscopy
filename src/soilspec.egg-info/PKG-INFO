@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: soilspec
+Version: 0.1.0
+Summary: Multimodal remote sensing pipeline for soil functional properties and land capability classification
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Provides-Extra: test
+Requires-Dist: pytest>=7; extra == "test"
