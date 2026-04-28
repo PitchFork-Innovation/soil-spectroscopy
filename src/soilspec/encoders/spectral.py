@@ -1,13 +1,14 @@
 """Spectral encoder module.
 
 Maps a per-tile bandwise spectral input to a fixed-dimension latent vector.
-Pluggable backends: 1D-CNN-shaped, transformer-shaped, autoencoder, and a
-statistical feature extractor — all selected through `SpectralEncoderRegistry`.
+Pluggable backends selected through `SpectralEncoderRegistry`:
 
-The deep-learning backends are implemented as deterministic numpy projections
-seeded by `(backend_name, latent_dim, seed)`. The patent does not require a
-specific framework; the contract is `encode(spectral_input) -> SpectralEmbedding`
-with a stable shape.
+- ``1d_cnn`` — real PyTorch 1D CNN over per-pixel spectra. Requires the
+  ``torch`` extra; weights are seeded for cross-process determinism.
+- ``transformer``, ``autoencoder``, ``statistical`` — numpy-only deterministic
+  projections retained for fast tests and as fallbacks.
+
+The contract is `encode(spectral_input) -> SpectralEmbedding` with a stable shape.
 """
 
 from __future__ import annotations
@@ -78,25 +79,68 @@ class _DeterministicProjection:
 
 
 class SpectralCNN1DEncoder:
-    """Backend stamped as `1d_cnn`. Aggregates per-pixel spectra via mean+std then projects."""
+    """PyTorch 1D CNN over per-pixel spectra.
+
+    Per-pixel spectrum (length B, single channel) flows through two Conv1d
+    layers with ReLU, an adaptive average pool collapses the spectral axis,
+    spatial mean across H*W produces a tile vector, and a final Linear+Tanh
+    maps to ``latent_dim``. All parameters are initialised from a torch
+    Generator seeded by ``stable_seed("1d_cnn", latent_dim, seed)``, which
+    keeps outputs byte-equal across processes on CPU.
+    """
 
     name = "1d_cnn"
 
     def __init__(self, latent_dim: int = 32, seed: int = 0) -> None:
+        import torch  # lazy: only the 1d_cnn backend pulls torch in
+        from torch import nn
+
         self.latent_dim = latent_dim
-        self._proj = _DeterministicProjection(self.name, latent_dim, seed)
+        self.seed = seed
+        self._torch = torch
+
+        gen = torch.Generator(device="cpu").manual_seed(
+            stable_seed(self.name, latent_dim, seed)
+        )
+        net = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(32, latent_dim),
+            nn.Tanh(),
+        )
+        for p in net.parameters():
+            with torch.no_grad():
+                if p.dim() >= 2:
+                    fan_in = 1
+                    for d in p.shape[1:]:
+                        fan_in *= int(d)
+                    std = (1.0 / fan_in) ** 0.5
+                    p.copy_(torch.randn(p.shape, generator=gen, dtype=torch.float32) * std)
+                else:
+                    p.zero_()
+        net.eval()
+        self._net = net
 
     def encode(self, tile_id: str, time: int, spectral: np.ndarray) -> SpectralEmbedding:
+        torch = self._torch
         data, valid = band_quality_filter(spectral, min_valid=1)
-        data = impute_missing_bands(data, valid)
-        per_band_mean = data.reshape(data.shape[0], -1).mean(axis=1)
-        per_band_std = data.reshape(data.shape[0], -1).std(axis=1)
-        feature = np.concatenate([per_band_mean, per_band_std])
-        # tanh nonlinearity on the projection — bounded output for tests
-        v = np.tanh(self._proj.project(feature))
+        data = impute_missing_bands(data, valid)  # (B, H, W), float32, finite
+        b, h, w = data.shape
+        # Each pixel is a 1D signal of length B with 1 channel: (HW, 1, B).
+        x = np.ascontiguousarray(
+            data.transpose(1, 2, 0).reshape(h * w, 1, b), dtype=np.float32
+        )
+        with torch.no_grad():
+            feat = self._net(torch.from_numpy(x))  # (HW, latent_dim)
+            tile_vec = feat.mean(dim=0)  # (latent_dim,)
+        v = tile_vec.cpu().numpy().astype(np.float32)
         assert_finite(v, "spectral.1d_cnn.embedding")
         return SpectralEmbedding(
-            tile_id=tile_id, time=time, vector=v.astype(np.float32),
+            tile_id=tile_id, time=time, vector=v,
             backend=self.name, valid_bands=int(valid.sum()),
         )
 

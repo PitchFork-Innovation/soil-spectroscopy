@@ -5,10 +5,5 @@
     "r001c000": "monitor",
     "r001c001": "monitor"
   },
-  "risk_areas": {
-    "r000c000": "erosion_high",
-    "r000c001": "erosion_high",
-    "r001c000": "erosion_high",
-    "r001c001": "erosion_high"
-  }
+  "risk_areas": {}
 }
