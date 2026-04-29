@@ -10,6 +10,10 @@ from .adapters import (
 from .ingestion import Ingestion
 from .mcp import MCPAdapter, MCP_TOOL_SCHEMA, MCPRequestError
 from .metadata import MetadataParser, MetadataValidationError
+from .planetary import (
+    PlanetaryComputerSentinel1Adapter,
+    PlanetaryComputerSentinel2Adapter,
+)
 
 __all__ = [
     "SourceAdapter",
@@ -25,4 +29,6 @@ __all__ = [
     "MCPRequestError",
     "MetadataParser",
     "MetadataValidationError",
+    "PlanetaryComputerSentinel1Adapter",
+    "PlanetaryComputerSentinel2Adapter",
 ]
