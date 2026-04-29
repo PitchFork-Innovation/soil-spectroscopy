@@ -3,17 +3,21 @@
 Maps a per-tile bandwise spectral input to a fixed-dimension latent vector.
 Pluggable backends selected through `SpectralEncoderRegistry`:
 
-- ``1d_cnn`` — real PyTorch 1D CNN over per-pixel spectra. Requires the
-  ``torch`` extra; weights are seeded for cross-process determinism.
-- ``transformer``, ``autoencoder``, ``statistical`` — numpy-only deterministic
-  projections retained for fast tests and as fallbacks.
+- ``1d_cnn`` — real PyTorch 1D CNN over per-pixel spectra.
+- ``transformer`` — per-band patch-embed + ``nn.MultiheadAttention`` self-
+  attention over band tokens.
+- ``autoencoder`` — real torch encoder/decoder pair; ``reconstruct`` runs the
+  trained decoder.
+- ``statistical`` — pure summary statistics; no learned weights by design.
+
+All torch backends require the ``torch`` extra; weights are seeded for
+cross-process determinism.
 
 The contract is `encode(spectral_input) -> SpectralEmbedding` with a stable shape.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
@@ -60,22 +64,6 @@ class SpectralEncoder(Protocol):
     latent_dim: int
 
     def encode(self, tile_id: str, time: int, spectral: np.ndarray) -> SpectralEmbedding: ...
-
-
-@dataclass
-class _DeterministicProjection:
-    """Shared utility: a seeded random projection from B*H*W -> latent_dim."""
-
-    backend: str
-    latent_dim: int
-    seed: int
-
-    def project(self, x: np.ndarray) -> np.ndarray:
-        flat = x.reshape(-1)
-        rng = np.random.default_rng(stable_seed(self.backend, self.latent_dim, self.seed))
-        # generate weight matrix lazily; size limited by flat length
-        w = rng.standard_normal(size=(self.latent_dim, flat.shape[0])).astype(np.float32) / np.sqrt(flat.shape[0])
-        return w @ flat.astype(np.float32)
 
 
 class SpectralCNN1DEncoder:
@@ -145,57 +133,150 @@ class SpectralCNN1DEncoder:
         )
 
 
+def _seeded_init(net, gen, torch) -> None:
+    """Manual fan-in init driven by a seeded torch.Generator."""
+    for p in net.parameters():
+        with torch.no_grad():
+            if p.dim() >= 2:
+                fan_in = 1
+                for d in p.shape[1:]:
+                    fan_in *= int(d)
+                std = (1.0 / fan_in) ** 0.5
+                p.copy_(torch.randn(p.shape, generator=gen, dtype=torch.float32) * std)
+            else:
+                p.zero_()
+
+
 class SpectralTransformerEncoder:
-    """Backend stamped as `transformer`. Token-pools per-band statistics, then projects."""
+    """Per-band token transformer.
+
+    Each band is summarised by 4 spatial statistics (mean, std, min, max),
+    embedded via ``nn.Linear`` to ``embed_dim``, then a single
+    ``nn.MultiheadAttention`` block aggregates band tokens. Mean-pool over
+    output tokens projects to ``latent_dim``.
+
+    The architecture is independent of ``n_bands`` (the patch-embed acts on
+    the 4-stat per-band feature), so weights are built eagerly and reused.
+    """
 
     name = "transformer"
+    embed_dim: int = 32
+    num_heads: int = 4
 
     def __init__(self, latent_dim: int = 32, seed: int = 0) -> None:
+        import torch
+        from torch import nn
+
         self.latent_dim = latent_dim
-        self._proj = _DeterministicProjection(self.name, latent_dim, seed)
+        self.seed = seed
+        self._torch = torch
+
+        gen = torch.Generator(device="cpu").manual_seed(
+            stable_seed(self.name, latent_dim, seed)
+        )
+        self._patch_embed = nn.Linear(4, self.embed_dim)
+        self._attn = nn.MultiheadAttention(
+            embed_dim=self.embed_dim, num_heads=self.num_heads, batch_first=True,
+        )
+        self._head = nn.Sequential(nn.Linear(self.embed_dim, latent_dim), nn.Tanh())
+        for sub in (self._patch_embed, self._attn, self._head):
+            _seeded_init(sub, gen, torch)
+            sub.eval()
 
     def encode(self, tile_id: str, time: int, spectral: np.ndarray) -> SpectralEmbedding:
+        torch = self._torch
         data, valid = band_quality_filter(spectral, min_valid=1)
         data = impute_missing_bands(data, valid)
-        # cls-token-style aggregation: weighted mean across bands by softmax scores
-        scores = np.linalg.norm(data.reshape(data.shape[0], -1), axis=1)
-        scores = scores - scores.max()
-        weights = np.exp(scores)
-        weights = weights / weights.sum()
-        token = (data.reshape(data.shape[0], -1) * weights[:, None]).sum(axis=0)
-        v = np.tanh(self._proj.project(token))
-        assert_finite(v, "spectral.transformer.embedding")
+        flat = data.reshape(data.shape[0], -1)
+        feats = np.stack(
+            [flat.mean(axis=1), flat.std(axis=1), flat.min(axis=1), flat.max(axis=1)],
+            axis=1,
+        ).astype(np.float32)  # (B, 4)
+        with torch.no_grad():
+            tokens = self._patch_embed(torch.from_numpy(feats)).unsqueeze(0)  # (1, B, embed)
+            attn_out, _ = self._attn(tokens, tokens, tokens, need_weights=False)
+            pooled = attn_out.mean(dim=1).squeeze(0)  # (embed,)
+            v = self._head(pooled)
+        out = v.cpu().numpy().astype(np.float32)
+        assert_finite(out, "spectral.transformer.embedding")
         return SpectralEmbedding(
-            tile_id=tile_id, time=time, vector=v.astype(np.float32),
+            tile_id=tile_id, time=time, vector=out,
             backend=self.name, valid_bands=int(valid.sum()),
         )
 
 
 class SpectralAutoencoderEncoder:
-    """Backend stamped as `autoencoder`. Encodes, exposes a reconstruction head used in training."""
+    """Real torch encoder/decoder over per-band channel means.
+
+    The encoder dim depends on ``n_bands``; we lazy-build (and cache) the
+    encoder/decoder the first time we see a given ``n_bands`` so that
+    ``reconstruct(emb, n_bands)`` always returns through the encoder's
+    matching decoder rather than a fresh random matrix.
+    """
 
     name = "autoencoder"
+    hidden: int = 64
 
     def __init__(self, latent_dim: int = 32, seed: int = 0) -> None:
+        import torch
+        self._torch = torch
         self.latent_dim = latent_dim
-        self._proj = _DeterministicProjection(self.name, latent_dim, seed)
+        self.seed = seed
+        self._enc: object | None = None
+        self._dec: object | None = None
+        self._built_for: int | None = None
+
+    def _build(self, n_bands: int) -> None:
+        torch = self._torch
+        from torch import nn
+
+        gen = torch.Generator(device="cpu").manual_seed(
+            stable_seed(self.name, n_bands, self.latent_dim, self.seed)
+        )
+        enc = nn.Sequential(
+            nn.Linear(n_bands, self.hidden),
+            nn.GELU(),
+            nn.Linear(self.hidden, self.latent_dim),
+            nn.Tanh(),
+        )
+        dec = nn.Sequential(
+            nn.Linear(self.latent_dim, self.hidden),
+            nn.GELU(),
+            nn.Linear(self.hidden, n_bands),
+        )
+        _seeded_init(enc, gen, torch)
+        _seeded_init(dec, gen, torch)
+        enc.eval()
+        dec.eval()
+        self._enc = enc
+        self._dec = dec
+        self._built_for = n_bands
 
     def encode(self, tile_id: str, time: int, spectral: np.ndarray) -> SpectralEmbedding:
+        torch = self._torch
         data, valid = band_quality_filter(spectral, min_valid=1)
         data = impute_missing_bands(data, valid)
-        flat = data.mean(axis=(1, 2))  # per-band channel
-        v = np.tanh(self._proj.project(flat))
-        assert_finite(v, "spectral.autoencoder.embedding")
+        flat = data.mean(axis=(1, 2)).astype(np.float32)  # (B,)
+        n_bands = int(flat.shape[0])
+        if self._built_for != n_bands:
+            self._build(n_bands)
+        with torch.no_grad():
+            v = self._enc(torch.from_numpy(flat))  # type: ignore[misc]
+        out = v.cpu().numpy().astype(np.float32)
+        assert_finite(out, "spectral.autoencoder.embedding")
         return SpectralEmbedding(
-            tile_id=tile_id, time=time, vector=v.astype(np.float32),
+            tile_id=tile_id, time=time, vector=out,
             backend=self.name, valid_bands=int(valid.sum()),
         )
 
     def reconstruct(self, embedding: SpectralEmbedding, n_bands: int) -> np.ndarray:
-        """Tiny decoder; used by the training/back-prop loop in the patent claim."""
-        rng = np.random.default_rng(stable_seed(self.name, "decode", n_bands))
-        w = rng.standard_normal(size=(n_bands, embedding.vector.shape[0])).astype(np.float32) / np.sqrt(embedding.vector.shape[0])
-        return w @ embedding.vector
+        """Run the matching decoder; rebuilds for n_bands if first time seen."""
+        torch = self._torch
+        if self._built_for != n_bands:
+            self._build(n_bands)
+        with torch.no_grad():
+            r = self._dec(torch.from_numpy(embedding.vector.astype(np.float32)))  # type: ignore[misc]
+        return r.cpu().numpy().astype(np.float32)
 
 
 class SpectralStatisticalEncoder:
