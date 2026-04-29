@@ -141,14 +141,9 @@ def test_s1_grd_adapter_keeps_raw_values():
     assert assets[0].metadata.extra["calibration"] == "raw_dn"
 
 
-def test_s1_default_collection_depends_on_subscription_key(monkeypatch):
-    monkeypatch.delenv("PC_SDK_SUBSCRIPTION_KEY", raising=False)
-    a = PlanetaryComputerSentinel1Adapter()
-    assert a.collection == "sentinel-1-grd"
-
-    monkeypatch.setenv("PC_SDK_SUBSCRIPTION_KEY", "secret")
-    b = PlanetaryComputerSentinel1Adapter()
-    assert b.collection == "sentinel-1-rtc"
+def test_s1_defaults_to_rtc():
+    assert PlanetaryComputerSentinel1Adapter().collection == "sentinel-1-rtc"
+    assert PlanetaryComputerSentinel1Adapter(collection="sentinel-1-grd").collection == "sentinel-1-grd"
 
 
 def test_stac_failure_is_wrapped_in_unreachable():

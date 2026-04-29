@@ -11,10 +11,12 @@ matches the synthetic adapters so downstream preprocessing is unaffected:
   are ``sigma0`` in dB when reading the RTC collection, raw DN otherwise.
 
 Optional dependency: install with ``pip install soilspec[planetary]``. The
-``planetary_computer`` library auto-injects a SAS token; if the
-``sentinel-1-rtc`` collection isn't accessible (no PC subscription key in
-``PC_SDK_SUBSCRIPTION_KEY``) the S1 adapter falls back to ``sentinel-1-grd``,
-which is anonymous-readable.
+``planetary_computer`` library auto-signs asset URLs with a short-lived SAS
+token; both ``sentinel-2-l2a`` and ``sentinel-1-rtc`` on PC are
+anonymous-readable today, so no subscription key is required for normal
+use. (``sentinel-1-grd`` exists too but is stored in raw radar geometry
+without a projected CRS, which prevents bbox-windowed reads — RTC is the
+only useful S1 collection for this pipeline.)
 
 CRS caveat: the read is windowed but not reprojected — pixels stay in the
 source COG's native CRS (typically a UTM zone). Pipeline encoders are
@@ -25,7 +27,6 @@ straddle multiple zones should be tiled before fetching.
 from __future__ import annotations
 
 import hashlib
-import os
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -177,9 +178,10 @@ class PlanetaryComputerSentinel2Adapter:
 class PlanetaryComputerSentinel1Adapter:
     """Sentinel-1 SAR backscatter from Microsoft Planetary Computer.
 
-    Defaults to ``sentinel-1-rtc`` (terrain-corrected sigma0) when the
-    ``PC_SDK_SUBSCRIPTION_KEY`` env var is set; falls back to
-    ``sentinel-1-grd`` (anonymous-readable, raw DN) otherwise.
+    Defaults to ``sentinel-1-rtc`` (terrain-corrected sigma0 in dB).
+    ``sentinel-1-grd`` is also accepted but stored in raw radar geometry
+    without a projected CRS, so bbox-windowed reads will fail — only use it
+    if you intend to handle the raw-geometry case yourself.
     """
 
     provider = "planetary-s1"
@@ -188,15 +190,9 @@ class PlanetaryComputerSentinel1Adapter:
     def __init__(
         self,
         tile_size: int = 32,
-        collection: str | None = None,
+        collection: str = "sentinel-1-rtc",
     ) -> None:
         self.tile_size = int(tile_size)
-        if collection is None:
-            collection = (
-                "sentinel-1-rtc"
-                if os.environ.get("PC_SDK_SUBSCRIPTION_KEY")
-                else "sentinel-1-grd"
-            )
         self.collection = collection
 
     def fetch(self, aoi: AOI, window: TimeWindow) -> Iterable[RawAsset]:
