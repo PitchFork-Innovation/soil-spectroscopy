@@ -1,9 +1,14 @@
 {
   "priority_zones": {
-    "r000c000": "monitor",
-    "r000c001": "monitor",
-    "r001c000": "monitor",
-    "r001c001": "monitor"
+    "r000c000": "irrigate_hold",
+    "r000c001": "irrigate_hold",
+    "r001c000": "irrigate_hold",
+    "r001c001": "irrigate_hold"
   },
-  "risk_areas": {}
+  "risk_areas": {
+    "r000c000": "erosion_high",
+    "r000c001": "erosion_high",
+    "r001c000": "erosion_high",
+    "r001c001": "erosion_high"
+  }
 }
