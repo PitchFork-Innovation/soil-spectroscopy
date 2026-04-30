@@ -18,7 +18,7 @@ The contract is `encode(spectral_input) -> SpectralEmbedding` with a stable shap
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Iterator, Protocol
 
 import numpy as np
 
@@ -132,6 +132,43 @@ class SpectralCNN1DEncoder:
             backend=self.name, valid_bands=int(valid.sum()),
         )
 
+    # -------------------- trainable interface ----------------------------
+
+    def forward_torch(self, spectral_t):
+        """Tensor-native forward over a (B,H,W) or batched (N,B,H,W) input.
+
+        Imputation/quality-filter is gradient-pass-through (NaNs are zeroed).
+        """
+        if spectral_t.dim() == 3:
+            squeeze = True
+            spectral_t = spectral_t.unsqueeze(0)
+        else:
+            squeeze = False
+        n, b, h, w = spectral_t.shape
+        # Replace non-finite values with zeros so the encoder produces stable
+        # output even when bands have NaNs (matches impute_missing_bands).
+        spectral_t = self._torch.nan_to_num(spectral_t, nan=0.0, posinf=0.0, neginf=0.0)
+        # (N*HW, 1, B) per the numpy path.
+        x = spectral_t.permute(0, 2, 3, 1).reshape(n * h * w, 1, b)
+        feat = self._net(x)  # (N*HW, latent_dim)
+        tile_vec = feat.view(n, h * w, -1).mean(dim=1)
+        return tile_vec.squeeze(0) if squeeze else tile_vec
+
+    def build(self, n_bands: int | None = None) -> None:
+        # 1d_cnn doesn't depend on n_bands at construction; method exists for
+        # API parity with the other encoders.
+        return None
+
+    def parameters(self) -> Iterator:
+        return self._net.parameters()
+
+    def state_dict(self) -> dict:
+        return {"net": self._net.state_dict()}
+
+    def load_state_dict(self, sd: dict) -> None:
+        if "net" in sd:
+            self._net.load_state_dict(sd["net"])
+
 
 def _seeded_init(net, gen, torch) -> None:
     """Manual fan-in init driven by a seeded torch.Generator."""
@@ -204,6 +241,55 @@ class SpectralTransformerEncoder:
             backend=self.name, valid_bands=int(valid.sum()),
         )
 
+    # -------------------- trainable interface ----------------------------
+
+    def forward_torch(self, spectral_t):
+        if spectral_t.dim() == 3:
+            squeeze = True
+            spectral_t = spectral_t.unsqueeze(0)
+        else:
+            squeeze = False
+        spectral_t = self._torch.nan_to_num(spectral_t, nan=0.0, posinf=0.0, neginf=0.0)
+        n, b, h, w = spectral_t.shape
+        flat = spectral_t.view(n, b, h * w)
+        # Per-band stats: mean/std/min/max over spatial dim.
+        f_mean = flat.mean(dim=2)
+        f_std = flat.std(dim=2)
+        f_min = flat.min(dim=2).values
+        f_max = flat.max(dim=2).values
+        feats = self._torch.stack([f_mean, f_std, f_min, f_max], dim=2)  # (N, B, 4)
+        tokens = self._patch_embed(feats)  # (N, B, embed)
+        attn_out, _ = self._attn(tokens, tokens, tokens, need_weights=False)
+        pooled = attn_out.mean(dim=1)  # (N, embed)
+        v = self._head(pooled)  # (N, latent_dim)
+        return v.squeeze(0) if squeeze else v
+
+    def build(self, n_bands: int | None = None) -> None:
+        return None
+
+    def parameters(self) -> Iterator:
+        from itertools import chain
+        return chain(
+            self._patch_embed.parameters(),
+            self._attn.parameters(),
+            self._head.parameters(),
+        )
+
+    def state_dict(self) -> dict:
+        return {
+            "patch_embed": self._patch_embed.state_dict(),
+            "attn": self._attn.state_dict(),
+            "head": self._head.state_dict(),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        if "patch_embed" in sd:
+            self._patch_embed.load_state_dict(sd["patch_embed"])
+        if "attn" in sd:
+            self._attn.load_state_dict(sd["attn"])
+        if "head" in sd:
+            self._head.load_state_dict(sd["head"])
+
 
 class SpectralAutoencoderEncoder:
     """Real torch encoder/decoder over per-band channel means.
@@ -258,8 +344,7 @@ class SpectralAutoencoderEncoder:
         data = impute_missing_bands(data, valid)
         flat = data.mean(axis=(1, 2)).astype(np.float32)  # (B,)
         n_bands = int(flat.shape[0])
-        if self._built_for != n_bands:
-            self._build(n_bands)
+        self.build(n_bands)
         with torch.no_grad():
             v = self._enc(torch.from_numpy(flat))  # type: ignore[misc]
         out = v.cpu().numpy().astype(np.float32)
@@ -268,6 +353,54 @@ class SpectralAutoencoderEncoder:
             tile_id=tile_id, time=time, vector=out,
             backend=self.name, valid_bands=int(valid.sum()),
         )
+
+    # -------------------- trainable interface ----------------------------
+
+    def build(self, n_bands: int | None = None) -> None:
+        if n_bands is None:
+            return  # caller can build lazily on first forward
+        if self._built_for != n_bands:
+            self._build(int(n_bands))
+
+    def forward_torch(self, spectral_t):
+        if spectral_t.dim() == 3:
+            squeeze = True
+            spectral_t = spectral_t.unsqueeze(0)
+        else:
+            squeeze = False
+        spectral_t = self._torch.nan_to_num(spectral_t, nan=0.0, posinf=0.0, neginf=0.0)
+        # Per-band channel mean: (N, B)
+        flat = spectral_t.mean(dim=(2, 3))
+        n_bands = int(flat.shape[1])
+        self.build(n_bands)
+        v = self._enc(flat)  # (N, latent_dim)
+        return v.squeeze(0) if squeeze else v
+
+    def parameters(self) -> Iterator:
+        if self._enc is None:
+            return iter(())
+        from itertools import chain
+        return chain(self._enc.parameters(), self._dec.parameters())
+
+    def state_dict(self) -> dict:
+        if self._enc is None:
+            return {}
+        return {
+            "enc": self._enc.state_dict(),
+            "dec": self._dec.state_dict(),
+            "n_bands": int(self._built_for or 0),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        if not sd:
+            return
+        n_bands = int(sd.get("n_bands", 0))
+        if n_bands > 0:
+            self.build(n_bands)
+        if self._enc is not None and "enc" in sd:
+            self._enc.load_state_dict(sd["enc"])
+        if self._dec is not None and "dec" in sd:
+            self._dec.load_state_dict(sd["dec"])
 
     def reconstruct(self, embedding: SpectralEmbedding, n_bands: int) -> np.ndarray:
         """Run the matching decoder; rebuilds for n_bands if first time seen."""
@@ -302,6 +435,42 @@ class SpectralStatisticalEncoder:
             tile_id=tile_id, time=time, vector=v,
             backend=self.name, valid_bands=int(valid.sum()),
         )
+
+    # No trainable params; forward_torch returns the same statistics as a tensor.
+
+    def forward_torch(self, spectral_t):
+        import torch as _t
+
+        if spectral_t.dim() == 3:
+            squeeze = True
+            spectral_t = spectral_t.unsqueeze(0)
+        else:
+            squeeze = False
+        spectral_t = _t.nan_to_num(spectral_t, nan=0.0, posinf=0.0, neginf=0.0)
+        n, b, h, w = spectral_t.shape
+        flat = spectral_t.view(n, b, h * w)
+        stats = _t.cat([
+            flat.mean(dim=2),
+            flat.std(dim=2),
+            flat.amin(dim=2),
+            flat.amax(dim=2),
+        ], dim=1)  # (N, 4*B)
+        out = _t.zeros(n, self.latent_dim, dtype=stats.dtype)
+        take = min(self.latent_dim, int(stats.shape[1]))
+        out[:, :take] = stats[:, :take]
+        return out.squeeze(0) if squeeze else out
+
+    def build(self, n_bands: int | None = None) -> None:
+        return None
+
+    def parameters(self) -> Iterator:
+        return iter(())
+
+    def state_dict(self) -> dict:
+        return {}
+
+    def load_state_dict(self, sd: dict) -> None:
+        return None
 
 
 SpectralEncoderRegistry: Registry[SpectralEncoder] = Registry("spectral-encoders")

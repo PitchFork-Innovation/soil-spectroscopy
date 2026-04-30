@@ -89,6 +89,20 @@ class LiftingLayer:
             v = self._net(torch.from_numpy(x.astype(np.float32)))
         return v.cpu().numpy().astype(np.float32)
 
+    def forward_torch(self, x):
+        """Tensor-native forward; supports ``(D,)`` or batched ``(N,D)``."""
+        return self._net(x)
+
+    def parameters(self):
+        return self._net.parameters()
+
+    def state_dict(self) -> dict:
+        return {"net": self._net.state_dict()}
+
+    def load_state_dict(self, sd: dict) -> None:
+        if "net" in sd:
+            self._net.load_state_dict(sd["net"])
+
 
 # ---------------------------------------------------------------------------
 # Members
@@ -119,6 +133,19 @@ class ClassicMLMember:
             out = self._net(torch.from_numpy(lifted.astype(np.float32)))
         v = out.cpu().numpy()
         return {name: float(v[i]) for i, name in enumerate(SOIL_PROPERTY_NAMES)}
+
+    def forward_torch(self, lifted_t):
+        return self._net(lifted_t)
+
+    def parameters(self):
+        return self._net.parameters()
+
+    def state_dict(self) -> dict:
+        return {"net": self._net.state_dict()}
+
+    def load_state_dict(self, sd: dict) -> None:
+        if "net" in sd:
+            self._net.load_state_dict(sd["net"])
 
 
 class DeepLearningMember:
@@ -154,6 +181,19 @@ class DeepLearningMember:
             out = self._net(torch.from_numpy(lifted.astype(np.float32)))
         v = out.cpu().numpy()
         return {name: float(v[i]) for i, name in enumerate(SOIL_PROPERTY_NAMES)}
+
+    def forward_torch(self, lifted_t):
+        return self._net(lifted_t)
+
+    def parameters(self):
+        return self._net.parameters()
+
+    def state_dict(self) -> dict:
+        return {"net": self._net.state_dict()}
+
+    def load_state_dict(self, sd: dict) -> None:
+        if "net" in sd:
+            self._net.load_state_dict(sd["net"])
 
 
 class MathematicalInterpolationMember:

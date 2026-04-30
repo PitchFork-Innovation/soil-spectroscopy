@@ -17,7 +17,7 @@ in_channels, seed)`` so outputs are byte-equal across processes on CPU.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Iterator, Protocol
 
 import numpy as np
 
@@ -31,6 +31,51 @@ class SpatialEncoder(Protocol):
     latent_dim: int
 
     def encode(self, tile_id: str, time: int, raster: np.ndarray) -> SpatialEmbedding: ...
+
+
+# ---------------------------------------------------------------------------
+# Trainable patch extraction (tensor-native, batch-friendly)
+# ---------------------------------------------------------------------------
+
+
+def _extract_patches_tensor(
+    raster_t, patch_size: int, stride: int, context_patches: int
+):
+    """Tensor equivalent of :func:`_sliding_patches` + edge-pad.
+
+    Accepts a raster tensor of shape ``(B, H, W)`` or ``(N, B, H, W)`` and
+    returns patches stacked as ``(N * n_patches, B, P, P)`` where ``N`` is
+    the batch size (added if missing). Gradient-friendly throughout.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if raster_t.dim() == 3:
+        raster_t = raster_t.unsqueeze(0)  # (1, B, H, W)
+    if raster_t.dim() != 4:
+        raise ValueError(
+            f"raster tensor must be (B,H,W) or (N,B,H,W); got {tuple(raster_t.shape)}"
+        )
+    pad = context_patches * patch_size
+    if pad > 0:
+        # 'replicate' matches numpy's mode='edge'.
+        raster_t = F.pad(raster_t, (pad, pad, pad, pad), mode="replicate")
+    n, b, h, w = raster_t.shape
+    if h < patch_size or w < patch_size:
+        # Fallback: treat the whole raster as a single patch sized to (P, P)
+        # via adaptive average pool — matches the numpy edge case at
+        # _patch_batch line 79 ("if not patches").
+        pooled = F.adaptive_avg_pool2d(raster_t, (patch_size, patch_size))
+        return pooled.view(n, 1, b, patch_size, patch_size).reshape(
+            n * 1, b, patch_size, patch_size
+        ), n, 1
+    # unfold extracts sliding patches: result shape (N, B, n_h, n_w, P, P)
+    patches = raster_t.unfold(2, patch_size, stride).unfold(3, patch_size, stride)
+    n_h, n_w = int(patches.shape[2]), int(patches.shape[3])
+    # rearrange to (N, n_h*n_w, B, P, P) -> (N*n_patches, B, P, P)
+    patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+    patches = patches.view(n * n_h * n_w, b, patch_size, patch_size)
+    return patches, n, n_h * n_w
 
 
 def _ensure_3d(raster: np.ndarray) -> np.ndarray:
@@ -147,6 +192,49 @@ class SpatialCNNEncoder:
             backend=self.name, patch_size=self.patch_size,
         )
 
+    # -------------------- trainable interface ----------------------------
+
+    def build(self, in_channels: int) -> None:
+        """Force lazy construction so the trainer can collect parameters."""
+        if self._net is None or self._in_channels != in_channels:
+            self._net = self._build(in_channels)
+            self._in_channels = in_channels
+
+    def forward_torch(self, raster_t):
+        """Tensor-native forward. Accepts ``(B,H,W)`` or batched ``(N,B,H,W)``;
+        returns ``(N, latent_dim)`` (or ``(latent_dim,)`` if input was unbatched).
+        Gradient-friendly — no ``no_grad`` here, no numpy conversion."""
+        if raster_t.dim() == 3:
+            squeeze = True
+            raster_t = raster_t.unsqueeze(0)
+        else:
+            squeeze = False
+        in_channels = int(raster_t.shape[1])
+        self.build(in_channels)
+        patches, n, n_patches = _extract_patches_tensor(
+            raster_t, self.patch_size, self.stride, self.context_patches,
+        )
+        feat = self._net(patches)  # (N*n_patches, latent_dim)
+        tile_vec = feat.view(n, n_patches, -1).mean(dim=1)  # (N, latent_dim)
+        return tile_vec.squeeze(0) if squeeze else tile_vec
+
+    def parameters(self) -> Iterator:
+        return self._net.parameters() if self._net is not None else iter(())
+
+    def state_dict(self) -> dict:
+        if self._net is None:
+            return {}
+        return {"net": self._net.state_dict(), "in_channels": int(self._in_channels or 0)}
+
+    def load_state_dict(self, sd: dict) -> None:
+        if not sd:
+            return
+        in_channels = int(sd.get("in_channels", 0))
+        if in_channels > 0:
+            self.build(in_channels)
+        if self._net is not None and "net" in sd:
+            self._net.load_state_dict(sd["net"])
+
 
 # ---------------------------------------------------------------------------
 # ViT backend
@@ -209,10 +297,7 @@ class SpatialViTEncoder:
         torch = self._torch
         batch = _patch_batch(raster, self.patch_size, self.stride, self.context_patches)
         in_channels = batch.shape[1]
-        if self._block is None or self._in_channels != in_channels:
-            seed_int = stable_seed(self.name, self.latent_dim, in_channels, self.context_patches, self.seed)
-            self._block = _ViTBlock(torch, in_channels, self.patch_size, self.latent_dim, seed_int)
-            self._in_channels = in_channels
+        self.build(in_channels)
         with torch.no_grad():
             v_t = self._block(torch.from_numpy(batch))
         v = v_t.cpu().numpy().astype(np.float32)
@@ -221,6 +306,73 @@ class SpatialViTEncoder:
             tile_id=tile_id, time=time, vector=v,
             backend=self.name, patch_size=self.patch_size,
         )
+
+    # -------------------- trainable interface ----------------------------
+
+    def build(self, in_channels: int) -> None:
+        if self._block is None or self._in_channels != in_channels:
+            seed_int = stable_seed(
+                self.name, self.latent_dim, in_channels, self.context_patches, self.seed,
+            )
+            self._block = _ViTBlock(
+                self._torch, in_channels, self.patch_size, self.latent_dim, seed_int,
+            )
+            self._in_channels = in_channels
+
+    def forward_torch(self, raster_t):
+        if raster_t.dim() == 3:
+            squeeze = True
+            raster_t = raster_t.unsqueeze(0)
+        else:
+            squeeze = False
+        in_channels = int(raster_t.shape[1])
+        self.build(in_channels)
+        patches, n, n_patches = _extract_patches_tensor(
+            raster_t, self.patch_size, self.stride, self.context_patches,
+        )
+        # _ViTBlock processes a single example's patches; loop in Python for
+        # batches. Batches ≤ 32 — the loop overhead is dwarfed by attention.
+        outs = []
+        for i in range(n):
+            chunk = patches[i * n_patches : (i + 1) * n_patches]
+            outs.append(self._block(chunk))
+        v = self._torch.stack(outs, dim=0)  # (N, latent_dim)
+        return v.squeeze(0) if squeeze else v
+
+    def parameters(self) -> Iterator:
+        if self._block is None:
+            return iter(())
+        from itertools import chain
+        return chain(
+            self._block.patch_embed.parameters(),
+            self._block.attn.parameters(),
+            self._block.head.parameters(),
+        )
+
+    def state_dict(self) -> dict:
+        if self._block is None:
+            return {}
+        return {
+            "patch_embed": self._block.patch_embed.state_dict(),
+            "attn": self._block.attn.state_dict(),
+            "head": self._block.head.state_dict(),
+            "in_channels": int(self._in_channels or 0),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        if not sd:
+            return
+        in_channels = int(sd.get("in_channels", 0))
+        if in_channels > 0:
+            self.build(in_channels)
+        if self._block is None:
+            return
+        if "patch_embed" in sd:
+            self._block.patch_embed.load_state_dict(sd["patch_embed"])
+        if "attn" in sd:
+            self._block.attn.load_state_dict(sd["attn"])
+        if "head" in sd:
+            self._block.head.load_state_dict(sd["head"])
 
 
 # ---------------------------------------------------------------------------
@@ -284,9 +436,7 @@ class SpatialAutoencoderEncoder:
         torch = self._torch
         batch = _patch_batch(raster, self.patch_size, self.stride, self.context_patches)
         in_channels = batch.shape[1]
-        if self._enc is None or self._in_channels != in_channels:
-            self._enc, self._dec = self._build(in_channels)
-            self._in_channels = in_channels
+        self.build(in_channels)
         with torch.no_grad():
             feat = self._enc(torch.from_numpy(batch))  # (N, latent_dim)
             tile_vec = feat.mean(dim=0)
@@ -296,6 +446,58 @@ class SpatialAutoencoderEncoder:
             tile_id=tile_id, time=time, vector=v,
             backend=self.name, patch_size=self.patch_size,
         )
+
+    # -------------------- trainable interface ----------------------------
+
+    def build(self, in_channels: int) -> None:
+        if self._enc is None or self._in_channels != in_channels:
+            self._enc, self._dec = self._build(in_channels)
+            self._in_channels = in_channels
+
+    def forward_torch(self, raster_t):
+        if raster_t.dim() == 3:
+            squeeze = True
+            raster_t = raster_t.unsqueeze(0)
+        else:
+            squeeze = False
+        in_channels = int(raster_t.shape[1])
+        self.build(in_channels)
+        patches, n, n_patches = _extract_patches_tensor(
+            raster_t, self.patch_size, self.stride, self.context_patches,
+        )
+        feat = self._enc(patches)
+        tile_vec = feat.view(n, n_patches, -1).mean(dim=1)
+        return tile_vec.squeeze(0) if squeeze else tile_vec
+
+    def parameters(self) -> Iterator:
+        if self._enc is None:
+            return iter(())
+        from itertools import chain
+        # Decoder is part of the trainable surface only if the user wants
+        # auxiliary reconstruction loss; for the supervised path we only
+        # need the encoder. Expose both — `train_pipeline` collects encoder
+        # params; SSL pretraining (Phase B) would also collect decoder.
+        return chain(self._enc.parameters(), self._dec.parameters())
+
+    def state_dict(self) -> dict:
+        if self._enc is None:
+            return {}
+        return {
+            "enc": self._enc.state_dict(),
+            "dec": self._dec.state_dict(),
+            "in_channels": int(self._in_channels or 0),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        if not sd:
+            return
+        in_channels = int(sd.get("in_channels", 0))
+        if in_channels > 0:
+            self.build(in_channels)
+        if self._enc is not None and "enc" in sd:
+            self._enc.load_state_dict(sd["enc"])
+        if self._dec is not None and "dec" in sd:
+            self._dec.load_state_dict(sd["dec"])
 
     def reconstruct(self, embedding: SpatialEmbedding, n_channels: int, hw: int) -> np.ndarray:  # pragma: no cover - aux
         torch = self._torch

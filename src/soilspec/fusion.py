@@ -16,7 +16,7 @@ a single-modality projection and stamps the output with ``degraded=True``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Iterator, Protocol
 
 import numpy as np
 
@@ -82,6 +82,50 @@ class _LazyTorchStrategy:
     def _build(self, spec_dim: int, spat_dim: int) -> None:  # pragma: no cover
         raise NotImplementedError
 
+    # -------------------- trainable interface ----------------------------
+    # Each subclass overrides ``fuse_tensors``; the following helpers live on
+    # the base because every strategy keeps trainable nn.Modules in named
+    # attributes that we collect via Python introspection.
+
+    def build(self, spec_dim: int, spat_dim: int) -> None:
+        """Force lazy construction so the trainer can collect parameters."""
+        self._ensure_built(int(spec_dim), int(spat_dim))
+
+    def fuse_tensors(self, spectral_t, spatial_t):  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _trainable_modules(self) -> list:
+        out: list = []
+        for attr in dir(self):
+            if attr.startswith("_") and not attr.startswith("_") or True:
+                pass  # placeholder to keep introspection on a single path
+        # Concrete subclasses set fixed attribute names — collect them here.
+        for attr_name in ("_net", "_spec_proj", "_spat_proj", "_attn", "_gate", "_head"):
+            mod = getattr(self, attr_name, None)
+            if mod is not None and hasattr(mod, "parameters"):
+                out.append((attr_name, mod))
+        return out
+
+    def parameters(self) -> Iterator:
+        from itertools import chain
+        return chain(*(m.parameters() for _, m in self._trainable_modules()))
+
+    def state_dict(self) -> dict:
+        sd: dict = {"_built_for": self._built_for}
+        for name, mod in self._trainable_modules():
+            sd[name] = mod.state_dict()
+        return sd
+
+    def load_state_dict(self, sd: dict) -> None:
+        if not sd:
+            return
+        bf = sd.get("_built_for")
+        if bf is not None:
+            self.build(int(bf[0]), int(bf[1]))
+        for name, mod in self._trainable_modules():
+            if name in sd:
+                mod.load_state_dict(sd[name])
+
 
 class ConcatFusion(_LazyTorchStrategy):
     """Concatenate then project: ``nn.Linear(spec+spat -> output_dim) + Tanh``."""
@@ -107,6 +151,18 @@ class ConcatFusion(_LazyTorchStrategy):
         with torch.no_grad():
             v = self._net(torch.from_numpy(x))
         return v.cpu().numpy().astype(np.float32)
+
+    def fuse_tensors(self, spectral_t, spatial_t):
+        if spectral_t.dim() == 1:
+            spectral_t = spectral_t.unsqueeze(0)
+            spatial_t = spatial_t.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        self._ensure_built(int(spectral_t.shape[1]), int(spatial_t.shape[1]))
+        x = self._torch.cat([spectral_t, spatial_t], dim=1)
+        v = self._net(x)
+        return v.squeeze(0) if squeeze else v
 
 
 class AttentionFusion(_LazyTorchStrategy):
@@ -152,6 +208,23 @@ class AttentionFusion(_LazyTorchStrategy):
             v = self._head(pooled)
         return v.cpu().numpy().astype(np.float32)
 
+    def fuse_tensors(self, spectral_t, spatial_t):
+        if spectral_t.dim() == 1:
+            spectral_t = spectral_t.unsqueeze(0)
+            spatial_t = spatial_t.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        self._ensure_built(int(spectral_t.shape[1]), int(spatial_t.shape[1]))
+        # Stack into 2 tokens per example: (N, 2, embed_dim)
+        spec_tok = self._spec_proj(spectral_t).unsqueeze(1)
+        spat_tok = self._spat_proj(spatial_t).unsqueeze(1)
+        tokens = self._torch.cat([spec_tok, spat_tok], dim=1)
+        attn_out, _ = self._attn(tokens, tokens, tokens, need_weights=False)
+        pooled = attn_out.mean(dim=1)
+        v = self._head(pooled)
+        return v.squeeze(0) if squeeze else v
+
 
 class GatingFusion(_LazyTorchStrategy):
     """Gated fusion: ``gate * spec_proj + (1 - gate) * spat_proj``."""
@@ -186,6 +259,20 @@ class GatingFusion(_LazyTorchStrategy):
             v = gate * a + (1.0 - gate) * b
         return v.cpu().numpy().astype(np.float32)
 
+    def fuse_tensors(self, spectral_t, spatial_t):
+        if spectral_t.dim() == 1:
+            spectral_t = spectral_t.unsqueeze(0)
+            spatial_t = spatial_t.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        self._ensure_built(int(spectral_t.shape[1]), int(spatial_t.shape[1]))
+        a = self._spec_proj(spectral_t)
+        b = self._spat_proj(spatial_t)
+        gate = self._gate(self._torch.cat([spectral_t, spatial_t], dim=1))
+        v = gate * a + (1.0 - gate) * b
+        return v.squeeze(0) if squeeze else v
+
 
 class DeepFusion(_LazyTorchStrategy):
     """3-layer MLP fusion: Linear → GELU → Linear → GELU → Linear → Tanh."""
@@ -218,6 +305,18 @@ class DeepFusion(_LazyTorchStrategy):
         with torch.no_grad():
             v = self._net(torch.from_numpy(x))
         return v.cpu().numpy().astype(np.float32)
+
+    def fuse_tensors(self, spectral_t, spatial_t):
+        if spectral_t.dim() == 1:
+            spectral_t = spectral_t.unsqueeze(0)
+            spatial_t = spatial_t.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        self._ensure_built(int(spectral_t.shape[1]), int(spatial_t.shape[1]))
+        x = self._torch.cat([spectral_t, spatial_t], dim=1)
+        v = self._net(x)
+        return v.squeeze(0) if squeeze else v
 
 
 FusionStrategyRegistry: Registry[FusionStrategy] = Registry("fusion-strategies")

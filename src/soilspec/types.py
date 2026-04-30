@@ -174,6 +174,22 @@ SOIL_PROPERTY_NAMES: tuple[str, ...] = (
     "erosion_susceptibility",
 )
 
+# Directly measurable soil properties — populated from real ground-truth
+# sources (ISMN, LUCAS, SMAP, SoilGrids). The functional properties above are
+# *derived* from these by the capability layer, so they live in a separate
+# vocabulary: training labels are measured, downstream consumers are functional.
+MEASURED_PROPERTY_NAMES: tuple[str, ...] = (
+    "soil_moisture",   # volumetric water content, m3/m3 (ISMN, SMAP)
+    "soc",             # soil organic carbon, g/kg (LUCAS, SoilGrids, WORLDSOILS)
+    "nitrogen",        # total N, g/kg (LUCAS)
+    "phosphorus",      # extractable P, mg/kg (LUCAS)
+    "potassium",       # extractable K, mg/kg (LUCAS)
+    "ph",              # pH in CaCl2 (LUCAS)
+    "clay_pct",        # %, 0-100 (SoilGrids, LUCAS)
+    "sand_pct",        # %, 0-100 (SoilGrids, LUCAS)
+    "bulk_density",    # g/cm3 (SoilGrids)
+)
+
 
 @dataclass(frozen=True)
 class SoilFunctionalProperties:
@@ -184,6 +200,25 @@ class SoilFunctionalProperties:
     properties: dict[str, float]
     uncertainty: dict[str, float]
     member_outputs: dict[str, dict[str, float]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GroundTruthSample:
+    """An aggregated ground-truth observation tied to a single tile + time bucket.
+
+    Multiple raw measurements (e.g. several ISMN sensor stations falling in
+    the same tile within a time bucket) are aggregated into one sample with
+    per-property mean and uncertainty (std-error of the mean). `n_observations`
+    records how many raw measurements went in, so downstream code can weight
+    samples or filter sparse tiles.
+    """
+
+    tile_id: str
+    time: int
+    properties: dict[str, float]
+    uncertainty: dict[str, float]
+    n_observations: int
+    source: str  # provider id: "ismn", "lucas", "smap", "soilgrids", ...
 
 
 @dataclass(frozen=True)

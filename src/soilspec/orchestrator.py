@@ -17,7 +17,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-from .capability import CapabilityScoringEngine, RulesEngine
+from .capability import CapabilityScoringEngine, MeasuredToFunctional, RulesEngine
 from .confidence import ConfidenceModule
 from .encoders import (
     SpatialEncoderRegistry, SpectralEncoderRegistry,
@@ -42,7 +42,7 @@ from .temporal import (
 )
 from .types import (
     SENTINEL1, SENTINEL2, VECTOR, AnalysisRequest, AOI, BoundingBox, JobHandle,
-    PreprocessedRecord, RunResult, TimeWindow,
+    PreprocessedRecord, RunResult, SoilFunctionalProperties, TimeWindow,
 )
 
 
@@ -62,6 +62,10 @@ class OrchestratorConfig:
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     sufficiency: SufficiencyCriteria = field(default_factory=lambda: SufficiencyCriteria(min_samples=2))
     seed: int = 0
+    # Optional: load a trained pipeline from StorageTier.MODEL on construction
+    # and use it instead of the random-init EnsembleInferenceEngine. None
+    # preserves today's behavior so existing tests keep passing.
+    model_key: tuple[str, str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +116,16 @@ class PipelineOrchestrator:
         self.rules = RulesEngine()
         self.publisher = MapPublisher(storage=self.storage)
         self.confidence = ConfidenceModule()
+
+        # Optional trained pipeline. When loaded, it replaces the random-init
+        # EnsembleInferenceEngine call in `_publish_for`; functional
+        # properties are derived from measured ones via MeasuredToFunctional.
+        self.trained_pipeline = None
+        self._measured_to_functional = MeasuredToFunctional()
+        if self.config.model_key is not None:
+            from .training import load_pipeline  # local: avoid import cycle in linters
+            family, version = self.config.model_key
+            self.trained_pipeline = load_pipeline(self.storage, family, version)
 
     # -------------------------- single-shot run ---------------------------
 
@@ -177,7 +191,7 @@ class PipelineOrchestrator:
                 channels=_channel_slices(self.config.fusion), strategy=self.config.fusion.strategy,
                 degraded=False,
             )
-            properties = self.inferer.infer(fused)
+            properties = self._infer_properties(request.aoi.aoi_id, cell_id, series.times[-1], fused)
             signals = self.analysis.analyze(features, properties)
             scores = self.scoring.score(features, properties, signals)
             classification = self.rules.classify(scores)
@@ -198,6 +212,62 @@ class PipelineOrchestrator:
             aoi_id=request.aoi.aoi_id,
             map_handles=(cap, rec, conf),
             generated_at=generation_time,
+        )
+
+
+    def _infer_properties(
+        self, aoi_id: str, cell_id: str, time: int, fused,
+    ) -> SoilFunctionalProperties:
+        """Predict per-tile soil functional properties.
+
+        If a trained pipeline is loaded, run it on the latest preprocessed
+        rasters for this tile and derive functional properties from the
+        measured-property predictions. Otherwise fall back to the existing
+        random-weight EnsembleInferenceEngine for backward compatibility.
+        """
+        if self.trained_pipeline is None:
+            return self.inferer.infer(fused)
+
+        from .storage.tiers import preprocessed_key
+
+        tp = self.trained_pipeline
+        # Pull the rasters for this (tile, time). If either is missing we
+        # cannot run the trained pipeline — fall back.
+        try:
+            s1 = self.storage.get(
+                StorageTier.PREPROCESSED,
+                preprocessed_key(aoi_id, cell_id, time, SENTINEL1),
+            )
+        except KeyError:
+            return self.inferer.infer(fused)
+        try:
+            s2 = self.storage.get(
+                StorageTier.PREPROCESSED,
+                preprocessed_key(aoi_id, cell_id, time, SENTINEL2),
+            )
+        except KeyError:
+            return self.inferer.infer(fused)
+        # Optional vector covariates for this tile.
+        try:
+            vector_attrs = self.storage.get(
+                StorageTier.PREPROCESSED,
+                preprocessed_key(aoi_id, cell_id, time, "vector"),
+            )
+        except KeyError:
+            vector_attrs = {}
+        if tp.vector_attr_names:
+            vec_features = np.array([
+                float(np.nanmean(vector_attrs[k]))
+                if k in vector_attrs and np.size(vector_attrs[k])
+                else 0.0
+                for k in tp.vector_attr_names
+            ], dtype=np.float32)
+        else:
+            vec_features = np.zeros(0, dtype=np.float32)
+        measured = tp.predict(s1, s2, vec_features)
+        return self._measured_to_functional.derive(
+            cell_id, time, measured,
+            member_outputs={"trained_pipeline": measured},
         )
 
 

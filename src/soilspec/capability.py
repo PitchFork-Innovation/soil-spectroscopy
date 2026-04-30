@@ -7,6 +7,13 @@ Two stages:
      boundary table into an ordinal land capability class (I..VIII).
 
 Weight tables and class boundaries are versioned in the model store.
+
+Also exposes :class:`MeasuredToFunctional` — derives the three functional
+properties consumed by the scoring engine (smi / infiltration_potential /
+erosion_susceptibility) from directly measurable quantities (soil_moisture,
+clay/sand/silt %, SOC, bulk density). Used by the orchestrator when a
+trained pipeline is loaded to bridge from measured-property predictions
+into the existing functional-property scoring pipeline.
 """
 
 from __future__ import annotations
@@ -18,6 +25,97 @@ from .types import (
     CAPABILITY_CLASSES, CapabilityClassification, CharacteristicScores,
     SoilFunctionalProperties, TemporalFeatureSet, TemporalSignals,
 )
+
+
+# ---------------------------------------------------------------------------
+# Measured -> Functional derivation
+# ---------------------------------------------------------------------------
+
+
+def _clip01(x: float) -> float:
+    if x is None or not (x == x):  # NaN guard
+        return 0.0
+    return max(0.0, min(1.0, float(x)))
+
+
+@dataclass
+class MeasuredToFunctional:
+    """Derive `SoilFunctionalProperties` from measured property predictions.
+
+    Formulas chosen for transparency over fidelity — all three derivations
+    are documented soil-science approximations, not learned mappings:
+
+    * **smi** = clip(soil_moisture, 0, 1). Volumetric water content is
+      already in [0,1]; the clip handles measurement noise.
+    * **infiltration_potential** = sand-/SOC-weighted approximation of the
+      Saxton & Rawls (2006) saturated hydraulic conductivity surrogate:
+      higher sand fraction → faster infiltration; higher SOC → modest
+      enhancement; higher bulk density → reduced infiltration. Output
+      normalized to [0,1].
+    * **erosion_susceptibility** ≈ USLE K-factor (Wischmeier 1971), simplified.
+      Higher silt fraction and lower SOC drive higher K (more erodible).
+      Output normalized to [0,1] so it slots into the scoring engine's
+      `erosion_susceptibility` slot directly (note the engine treats it as
+      "high = bad", inverted to `erosion_resistance` = 1 - this).
+
+    Missing measured properties default to neutral midpoints so the
+    pipeline degrades gracefully when (e.g.) ISMN-only training never
+    saw clay/sand labels.
+    """
+
+    sand_default: float = 40.0
+    silt_default: float = 30.0
+    clay_default: float = 25.0
+    soc_default: float = 15.0          # g/kg
+    bulk_density_default: float = 1.4  # g/cm³
+
+    def derive(
+        self, tile_id: str, time: int, measured: Mapping[str, float],
+        member_outputs: Mapping[str, Mapping[str, float]] | None = None,
+    ) -> SoilFunctionalProperties:
+        sand = float(measured.get("sand_pct", self.sand_default))
+        silt = float(measured.get("silt_pct", self.silt_default))
+        clay = float(measured.get("clay_pct", self.clay_default))
+        soc = float(measured.get("soc", self.soc_default))
+        bd = float(measured.get("bulk_density", self.bulk_density_default))
+        sm = float(measured.get("soil_moisture", 0.25))
+
+        smi = _clip01(sm)
+        # Saxton & Rawls-inspired infiltration proxy (normalized).
+        infiltration_raw = (
+            0.6 * (sand / 100.0)
+            + 0.2 * min(1.0, soc / 30.0)
+            - 0.3 * max(0.0, (bd - 1.0))
+            - 0.1 * (clay / 100.0)
+        )
+        # rescale from approximate [-0.4, 0.8] -> [0,1]
+        infiltration_potential = _clip01(0.5 + infiltration_raw)
+
+        # USLE K proxy. Wischmeier nomograph: K rises with silt+very_fine_sand,
+        # falls with SOC. We approximate with silt fraction and inverse SOC.
+        m_factor = (silt + 0.2 * sand) * (100.0 - clay)  # higher when erodible
+        soc_term = max(0.0, 12.0 - soc)  # SOC above 12 g/kg saturates
+        # k_raw scaled empirically so realistic inputs land near 0.2-0.5
+        k_raw = (m_factor * soc_term) / 1.0e5
+        erosion = _clip01(k_raw)
+
+        # Per-property uncertainty: trivial floor (0.0) when derived; any
+        # uncertainty information would have to come from the upstream
+        # measured-property predictor.
+        return SoilFunctionalProperties(
+            tile_id=tile_id, time=int(time),
+            properties={
+                "smi": smi,
+                "infiltration_potential": infiltration_potential,
+                "erosion_susceptibility": erosion,
+            },
+            uncertainty={
+                "smi": 0.0,
+                "infiltration_potential": 0.0,
+                "erosion_susceptibility": 0.0,
+            },
+            member_outputs=dict(member_outputs) if member_outputs else {},
+        )
 
 
 # ---------------------------------------------------------------------------

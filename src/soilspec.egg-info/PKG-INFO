@@ -6,3 +6,10 @@ Requires-Python: >=3.10
 Requires-Dist: numpy>=1.24
 Provides-Extra: test
 Requires-Dist: pytest>=7; extra == "test"
+Requires-Dist: torch>=2; extra == "test"
+Provides-Extra: torch
+Requires-Dist: torch>=2; extra == "torch"
+Provides-Extra: planetary
+Requires-Dist: pystac-client>=0.7; extra == "planetary"
+Requires-Dist: planetary-computer>=1.0; extra == "planetary"
+Requires-Dist: rasterio>=1.3; extra == "planetary"
