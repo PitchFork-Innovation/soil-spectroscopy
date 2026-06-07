@@ -11,8 +11,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from soilspec.groundtruth import (
-    GroundTruthDataset, Measurement, RasterTrainingExamples, TileGrid,
-    assemble_raster_examples,
+    GroundTruthDataset, Measurement, RasterTrainingExamples, TextRecord,
+    TileGrid, assemble_raster_examples,
 )
 from soilspec.storage import StorageTier, StorageTierManager, model_key
 from soilspec.training import (
@@ -379,3 +379,238 @@ def test_split_by_tile_preserves_tile_grouping():
     assert train_tiles & val_tiles == set()
     assert train_tiles & test_tiles == set()
     assert val_tiles & test_tiles == set()
+
+
+# ---------------------------------------------------------------------------
+# 7. Text modality (third input branch)
+# ---------------------------------------------------------------------------
+
+
+def _text_records_for(
+    examples: RasterTrainingExamples,
+    text_dim: int,
+    seed: int = 0,
+    skip_indices: tuple[int, ...] = (),
+    doc_per_tile: bool = True,
+) -> list[TextRecord]:
+    """Build aligned synthetic text records for an assembled examples set.
+
+    ``skip_indices`` are dropped from the emitted list so the corresponding
+    rows get the zero-vector + missing=1 path.
+    ``doc_per_tile=True`` ties a single doc_id to every (tile_id, *)
+    record — the configuration the leakage check exercises.
+    """
+    rng = np.random.default_rng(seed)
+    out: list[TextRecord] = []
+    tile_to_doc: dict[str, str] = {}
+    for i, (tile, bucket) in enumerate(examples.tile_keys):
+        if i in skip_indices:
+            continue
+        if doc_per_tile:
+            doc = tile_to_doc.setdefault(tile, f"doc_{tile}")
+        else:
+            doc = f"doc_{i}"
+        out.append(TextRecord(
+            tile_id=tile, time=bucket,
+            embedding=rng.normal(size=text_dim).astype(np.float32),
+            doc_id=doc, encoder="fake-text-encoder-v1",
+        ))
+    return out
+
+
+def test_assemble_without_text_preserves_legacy_shape():
+    """No text_records → text_dim=0, text_features (N, 0), behavior unchanged."""
+    records, ds = _make_examples(n_tiles=3, n_times_per_tile=4, seed=10)
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+    )
+    assert examples.text_dim == 0
+    assert examples.text_encoder is None
+    assert examples.text_features.shape == (len(examples), 0)
+    assert examples.text_features.dtype == np.float32
+
+
+def test_assemble_with_text_alignment_and_missing_rows():
+    """Aligned text fills the embedding; unmatched rows get zero+missing=1."""
+    records, ds = _make_examples(n_tiles=4, n_times_per_tile=3, seed=11)
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+    )
+    n = len(examples)
+    assert n > 0
+    text_dim = 24
+    # Drop text for rows 0 and 2 → expect missing=1 at those rows.
+    text_recs = _text_records_for(
+        examples, text_dim=text_dim, skip_indices=(0, 2),
+    )
+    aligned = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+        text_records=text_recs, text_encoder="fake-text-encoder-v1",
+    )
+    assert aligned.text_dim == text_dim
+    assert aligned.text_encoder == "fake-text-encoder-v1"
+    assert aligned.text_features.shape == (n, text_dim)
+    assert aligned.text_missing.shape == (n,)
+    assert aligned.text_missing[0] == 1.0
+    assert aligned.text_missing[2] == 1.0
+    # Zero vector at missing rows.
+    assert np.all(aligned.text_features[0] == 0.0)
+    assert np.all(aligned.text_features[2] == 0.0)
+    # Present rows get the real embedding, doc_id, and missing=0.
+    assert aligned.text_doc_ids[1] != ""
+    assert aligned.text_missing[1] == 0.0
+    assert not np.all(aligned.text_features[1] == 0.0)
+
+
+def test_train_pipeline_with_text_runs_and_uses_projection():
+    """Training with text builds a projection sublayer that has parameters."""
+    records, ds = _make_examples(n_tiles=4, n_times_per_tile=5, seed=12)
+    text_dim = 16
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+    )
+    text_recs = _text_records_for(examples, text_dim=text_dim, seed=12)
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+        text_records=text_recs,
+    )
+    cfg = PipelineTrainerConfig(
+        properties=("soil_moisture",),
+        epochs=4, batch_size=4,
+        val_fraction=0.0, test_fraction=0.25,
+        early_stopping_patience=None, warmup_epochs=1, seed=0,
+        text_projection_dim=8,
+    )
+    model, _metrics, _splits = train_pipeline(examples, cfg)
+    assert model.text_dim == text_dim
+    assert model._trainable.text_projection is not None
+    # The text projection should hold trainable params (Linear weight + bias
+    # + LayerNorm weight + bias = 4 tensors).
+    proj_params = list(model._trainable.text_projection.parameters())
+    assert len(proj_params) >= 2
+    # Predict shape is correct with batch text input.
+    n_test = len(_splits.test) or 1
+    s1_b = examples.s1[:n_test]
+    s2_b = examples.s2[:n_test]
+    tx_b = examples.text_features[:n_test]
+    miss_b = examples.text_missing[:n_test]
+    out = model.predict_batch(s1_b, s2_b, None, tx_b, miss_b)
+    assert out.shape == (n_test, 1)
+
+
+def test_train_pipeline_without_text_has_no_projection():
+    """No text → no projection layer, model state_dict has text_dim=0."""
+    records, ds = _make_examples(n_tiles=3, n_times_per_tile=5, seed=13)
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+    )
+    cfg = PipelineTrainerConfig(
+        properties=("soil_moisture",),
+        epochs=3, batch_size=4,
+        val_fraction=0.0, test_fraction=0.0, seed=0,
+    )
+    model, _, _ = train_pipeline(examples, cfg)
+    assert model.text_dim == 0
+    assert model._trainable.text_projection is None
+    sd = model.to_state_dict()
+    assert sd["text_dim"] == 0
+    assert "text_projection" not in sd
+
+
+def test_predict_with_missing_text_uses_zero_vector():
+    """On a text-aware model, predict() with text_features=None should fall
+    back to a zero vector + missing=1 — i.e., produce a finite, defined
+    prediction rather than erroring."""
+    records, ds = _make_examples(n_tiles=3, n_times_per_tile=5, seed=14)
+    text_dim = 12
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+    )
+    text_recs = _text_records_for(examples, text_dim=text_dim, seed=14)
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+        text_records=text_recs,
+    )
+    cfg = PipelineTrainerConfig(
+        properties=("soil_moisture",),
+        epochs=2, batch_size=4,
+        val_fraction=0.0, test_fraction=0.0, seed=0,
+        text_projection_dim=8,
+    )
+    model, _, _ = train_pipeline(examples, cfg)
+    # Predict without supplying text_features — should use zero + missing=1.
+    pred_missing = model.predict(examples.s1[0], examples.s2[0])
+    assert np.isfinite(pred_missing["soil_moisture"])
+    # And with explicit text → also finite, generally different from
+    # the missing-fallback path.
+    pred_present = model.predict(
+        examples.s1[0], examples.s2[0],
+        text_features=examples.text_features[0],
+        text_missing=0.0,
+    )
+    assert np.isfinite(pred_present["soil_moisture"])
+
+
+def test_text_model_save_load_round_trip_predictions():
+    """save → load preserves predictions on a text-aware pipeline."""
+    records, ds = _make_examples(n_tiles=3, n_times_per_tile=5, seed=15)
+    text_dim = 16
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+    )
+    text_recs = _text_records_for(examples, text_dim=text_dim, seed=15)
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+        text_records=text_recs, text_encoder="fake-text-encoder-v1",
+    )
+    cfg = PipelineTrainerConfig(
+        properties=("soil_moisture",),
+        epochs=4, batch_size=4,
+        val_fraction=0.0, test_fraction=0.0, seed=0,
+        text_projection_dim=8,
+    )
+    model, _, _ = train_pipeline(examples, cfg)
+    storage = StorageTierManager()
+    save_pipeline(storage, "pipeline_text", "0.1.0", model)
+    loaded = load_pipeline(storage, "pipeline_text", "0.1.0")
+    assert loaded.text_dim == text_dim
+    assert loaded.text_encoder == "fake-text-encoder-v1"
+    a = model.predict(
+        examples.s1[0], examples.s2[0],
+        text_features=examples.text_features[0],
+        text_missing=float(examples.text_missing[0]),
+    )["soil_moisture"]
+    b = loaded.predict(
+        examples.s1[0], examples.s2[0],
+        text_features=examples.text_features[0],
+        text_missing=float(examples.text_missing[0]),
+    )["soil_moisture"]
+    assert a == pytest.approx(b, rel=1e-5, abs=1e-5)
+
+
+def test_text_document_isolation_across_train_test():
+    """With one doc_id per tile, split_by_tile must yield disjoint doc_id
+    sets across the train/val/test partitions — i.e., no text leakage."""
+    records, ds = _make_examples(n_tiles=6, n_times_per_tile=4, seed=16)
+    text_dim = 8
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+    )
+    text_recs = _text_records_for(
+        examples, text_dim=text_dim, seed=16, doc_per_tile=True,
+    )
+    examples = assemble_raster_examples(
+        records, ds, property_names=("soil_moisture",),
+        text_records=text_recs,
+    )
+    # Every row carries a non-empty doc_id.
+    assert all(d != "" for d in examples.text_doc_ids)
+    splits = split_by_tile(
+        examples, val_fraction=0.34, test_fraction=0.34, seed=0,
+    )
+    docs_train = {examples.text_doc_ids[i] for i in splits.train}
+    docs_val = {examples.text_doc_ids[i] for i in splits.val}
+    docs_test = {examples.text_doc_ids[i] for i in splits.test}
+    assert docs_train & docs_val == set()
+    assert docs_train & docs_test == set()
+    assert docs_val & docs_test == set()

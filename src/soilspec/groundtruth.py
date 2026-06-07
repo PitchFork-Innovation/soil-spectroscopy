@@ -220,6 +220,25 @@ def grid_for_request(
 
 
 @dataclass(frozen=True)
+class TextRecord:
+    """A precomputed text embedding aligned to a (tile_id, time_bucket).
+
+    ``embedding`` is a fixed-size dense vector produced by an external,
+    frozen text encoder (e.g. a sentence-transformer). The pipeline never
+    fine-tunes that encoder — only the small downstream projection inside
+    the joint trainer is trainable. ``doc_id`` is a stable identifier for
+    the source document; the trainer uses it to detect train/test leakage
+    when the same doc backs multiple tiles.
+    """
+
+    tile_id: str
+    time: int
+    embedding: np.ndarray
+    doc_id: str = ""
+    encoder: str = ""
+
+
+@dataclass(frozen=True)
 class RasterTrainingExamples:
     """Aligned (raster, label) rows for end-to-end pipeline training.
 
@@ -240,6 +259,15 @@ class RasterTrainingExamples:
       - ``weights[prop]``: ``(N,)``; 1/σ² when uncertainty was reported,
         else ``n_observations``.
       - ``tile_keys``: ``((tile_id, bucket_start), ...)`` for spatial split.
+      - ``text_features``: ``(N, D_text)`` float32. ``D_text == 0`` when no
+        text modality is configured (rows are still indexed). Missing-row
+        positions hold the zero vector.
+      - ``text_missing``: ``(N,)`` float32 indicator — 1.0 where the row had
+        no aligned text embedding (and therefore got the zero vector), 0.0
+        otherwise. Length-N regardless of ``text_dim`` so it stays
+        concat-safe across AOIs that mix text-on and text-off rows.
+      - ``text_doc_ids``: ``(N,)`` strings — empty string for missing rows.
+        Used for the leakage check during split.
     """
 
     s1: np.ndarray
@@ -253,6 +281,15 @@ class RasterTrainingExamples:
     s1_bands: int
     s2_bands: int
     vector_attr_names: tuple[str, ...]
+    text_features: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0), dtype=np.float32)
+    )
+    text_missing: np.ndarray = field(
+        default_factory=lambda: np.zeros((0,), dtype=np.float32)
+    )
+    text_doc_ids: tuple[str, ...] = ()
+    text_dim: int = 0
+    text_encoder: str | None = None
 
     def __len__(self) -> int:
         return self.s1.shape[0]
@@ -272,6 +309,8 @@ def assemble_raster_examples(
     sources: Iterable[str] | None = None,
     s1_modality: str = "s1",
     s2_modality: str = "s2",
+    text_records: Iterable["TextRecord"] | None = None,
+    text_encoder: str | None = None,
 ) -> RasterTrainingExamples:
     """Join `PreprocessedRecord`s (raw rasters per tile) with `GroundTruthDataset`
     samples on ``(tile_id, time_bucket)``.
@@ -279,6 +318,18 @@ def assemble_raster_examples(
     Filters out records that lack S1 or S2 (we need both to feed the dual
     encoders) or lack any finite label. The result feeds straight into the
     end-to-end :func:`soilspec.training.train_pipeline`.
+
+    Parameters
+    ----------
+    text_records :
+        Optional iterable of :class:`TextRecord` carrying precomputed
+        fixed-size text embeddings. Aligned by ``(tile_id, time_bucket)``;
+        rows with no matching record get a zero vector and
+        ``text_missing == 1.0``. ``None`` disables the text modality
+        (``text_dim == 0``) and preserves the legacy two-modality contract.
+    text_encoder :
+        Stable identifier for the external encoder that produced the
+        embeddings. Persisted on the model for reproducibility.
     """
     props = tuple(property_names)
     allowed_sources = set(sources) if sources is not None else None
@@ -293,12 +344,39 @@ def assemble_raster_examples(
         sources_seen.add(s.source)
         by_key.setdefault((s.tile_id, s.time), []).append(s)
 
+    # Index text records by (tile_id, bucket). Determine text_dim and resolve
+    # the encoder tag from the records if not supplied explicitly.
+    text_by_key: dict[tuple[str, int], "TextRecord"] = {}
+    text_dim = 0
+    resolved_encoder = text_encoder
+    if text_records is not None:
+        for tr in text_records:
+            emb = np.asarray(tr.embedding, dtype=np.float32).reshape(-1)
+            if emb.size == 0:
+                continue
+            if text_dim == 0:
+                text_dim = int(emb.size)
+            elif emb.size != text_dim:
+                raise ValueError(
+                    f"inconsistent text embedding dim: {emb.size} vs {text_dim}"
+                )
+            bucket_start = (int(tr.time) // bucket) * bucket
+            text_by_key[(tr.tile_id, bucket_start)] = TextRecord(
+                tile_id=tr.tile_id, time=bucket_start, embedding=emb,
+                doc_id=tr.doc_id, encoder=tr.encoder,
+            )
+            if resolved_encoder is None and tr.encoder:
+                resolved_encoder = tr.encoder
+
     rows_s1: list[np.ndarray] = []
     rows_s2: list[np.ndarray] = []
     rows_vec: list[np.ndarray] = []
     rows_y: dict[str, list[float]] = {p: [] for p in props}
     rows_w: dict[str, list[float]] = {p: [] for p in props}
     keys: list[tuple[str, int]] = []
+    rows_text: list[np.ndarray] = []
+    rows_text_missing: list[float] = []
+    rows_doc_ids: list[str] = []
     vector_keys: list[str] | None = None
 
     for rec in records:
@@ -334,6 +412,22 @@ def assemble_raster_examples(
         rows_s2.append(np.asarray(rec.spatial[s2_modality], dtype=np.float32))
         rows_vec.append(feat)
         keys.append((rec.tile_id, bucket_start))
+
+        # Text alignment: zero vector + missing=1 when no record matches.
+        if text_dim > 0:
+            tr = text_by_key.get((rec.tile_id, bucket_start))
+            if tr is None:
+                rows_text.append(np.zeros(text_dim, dtype=np.float32))
+                rows_text_missing.append(1.0)
+                rows_doc_ids.append("")
+            else:
+                rows_text.append(tr.embedding.astype(np.float32, copy=False))
+                rows_text_missing.append(0.0)
+                rows_doc_ids.append(tr.doc_id)
+        else:
+            rows_text_missing.append(0.0)
+            rows_doc_ids.append("")
+
         for p in props:
             rows_y[p].append(y_row[p])
             rows_w[p].append(w_row[p])
@@ -351,6 +445,11 @@ def assemble_raster_examples(
             s1_bands=0,
             s2_bands=0,
             vector_attr_names=tuple(vector_keys or ()),
+            text_features=np.zeros((0, text_dim), dtype=np.float32),
+            text_missing=np.zeros((0,), dtype=np.float32),
+            text_doc_ids=(),
+            text_dim=text_dim,
+            text_encoder=resolved_encoder,
         )
 
     s1 = np.stack(rows_s1, axis=0)
@@ -360,6 +459,10 @@ def assemble_raster_examples(
     )
     y = {p: np.asarray(rows_y[p], dtype=np.float64) for p in props}
     w = {p: np.asarray(rows_w[p], dtype=np.float64) for p in props}
+    if text_dim > 0:
+        text_arr = np.stack(rows_text, axis=0)
+    else:
+        text_arr = np.zeros((len(rows_s1), 0), dtype=np.float32)
     return RasterTrainingExamples(
         s1=s1, s2=s2, vector_features=vec,
         y=y, weights=w,
@@ -369,6 +472,11 @@ def assemble_raster_examples(
         s1_bands=int(s1.shape[1]),
         s2_bands=int(s2.shape[1]),
         vector_attr_names=tuple(vector_keys or ()),
+        text_features=text_arr,
+        text_missing=np.asarray(rows_text_missing, dtype=np.float32),
+        text_doc_ids=tuple(rows_doc_ids),
+        text_dim=text_dim,
+        text_encoder=resolved_encoder,
     )
 
 
@@ -1071,6 +1179,7 @@ __all__ = [
     "LUCASAdapter",
     "GroundTruthSourceError",
     "RasterTrainingExamples",
+    "TextRecord",
     "assemble_raster_examples",
     "SOILGRIDS_LAYER_MAP",
     "SOILGRIDS_UNIT_DIVISORS",

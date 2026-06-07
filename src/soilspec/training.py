@@ -659,6 +659,9 @@ class PipelineTrainerConfig:
     early_stopping_patience: int | None = 25
     warmup_epochs: int = 5
     seed: int = 0
+    text_projection_dim: int = 32
+    """Output width of the trainable Linear projection applied to the frozen
+    text embedding. Ignored when no text features are supplied."""
 
 
 @dataclass
@@ -729,6 +732,7 @@ class _PipelineTrainable:
         s2_bands: int,
         vector_dim: int,
         n_props: int,
+        text_dim: int = 0,
     ) -> None:
         import torch
         from torch import nn
@@ -736,6 +740,8 @@ class _PipelineTrainable:
         self._torch = torch
         self.cfg = cfg
         self.n_props = n_props
+        self.text_dim = int(text_dim)
+        self.text_projection_dim = int(cfg.text_projection_dim)
         torch.manual_seed(int(cfg.seed))
 
         self.spatial_enc: SpatialEncoder = SpatialEncoderRegistry.create(
@@ -761,6 +767,20 @@ class _PipelineTrainable:
         )
 
         in_head = cfg.fusion_output_dim + int(vector_dim)
+        # Trainable text projection: Linear(text_dim, P) + LayerNorm. The
+        # upstream encoder is frozen — only this small head learns from
+        # joint signal. Skipped entirely when text_dim == 0 so the trainer
+        # behaves identically to the legacy two-modality model.
+        if self.text_dim > 0:
+            self.text_projection = nn.Sequential(
+                nn.Linear(self.text_dim, self.text_projection_dim),
+                nn.LayerNorm(self.text_projection_dim),
+            )
+            # +1 for the missingness scalar concatenated alongside the
+            # projected vector so the head can learn to discount missing rows.
+            in_head += self.text_projection_dim + 1
+        else:
+            self.text_projection = None
         self.head = nn.Sequential(
             nn.Linear(in_head, cfg.head_hidden_dim),
             nn.GELU(),
@@ -773,32 +793,57 @@ class _PipelineTrainable:
 
     # ---- composition ----
 
-    def forward(self, s1_t, s2_t, vec_t):
+    def forward(self, s1_t, s2_t, vec_t, text_t=None, text_missing_t=None):
         spat = self.spatial_enc.forward_torch(s1_t)  # type: ignore[attr-defined]
         spec = self.spectral_enc.forward_torch(s2_t)  # type: ignore[attr-defined]
         fused = self.fusion.fuse_tensors(spec, spat)  # type: ignore[attr-defined]
+        parts = [fused]
         if vec_t is not None and vec_t.shape[1] > 0:
-            combined = self._torch.cat([fused, vec_t], dim=1)
-        else:
-            combined = fused
+            parts.append(vec_t)
+        if self.text_projection is not None:
+            if text_t is None:
+                # Inference-time fallback: zero vector + "missing" flag set.
+                text_t = self._torch.zeros(
+                    fused.shape[0], self.text_dim, dtype=fused.dtype,
+                )
+                text_missing_t = self._torch.ones(
+                    fused.shape[0], 1, dtype=fused.dtype,
+                )
+            projected = self.text_projection(text_t)
+            if text_missing_t is None:
+                text_missing_t = self._torch.zeros(
+                    text_t.shape[0], 1, dtype=text_t.dtype,
+                )
+            elif text_missing_t.dim() == 1:
+                text_missing_t = text_missing_t.view(-1, 1)
+            parts.append(projected)
+            parts.append(text_missing_t.to(projected.dtype))
+        combined = self._torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
         return self.head(combined)
 
     def parameters(self) -> Iterable:
         from itertools import chain
-        return chain(
+        params = [
             self.spatial_enc.parameters(),  # type: ignore[attr-defined]
             self.spectral_enc.parameters(),  # type: ignore[attr-defined]
             self.fusion.parameters(),  # type: ignore[attr-defined]
             self.head.parameters(),
-        )
+        ]
+        if self.text_projection is not None:
+            params.append(self.text_projection.parameters())
+        return chain(*params)
 
     def train(self) -> None:
         self.head.train()
+        if self.text_projection is not None:
+            self.text_projection.train()
         for mod in self._sub_nn_modules():
             mod.train()
 
     def eval(self) -> None:
         self.head.eval()
+        if self.text_projection is not None:
+            self.text_projection.eval()
         for mod in self._sub_nn_modules():
             mod.eval()
 
@@ -834,6 +879,8 @@ class TrainedPipeline:
         y_mean: np.ndarray,
         y_std: np.ndarray,
         vector_attr_names: tuple[str, ...] = (),
+        text_dim: int = 0,
+        text_encoder: str | None = None,
     ) -> None:
         self.cfg = cfg
         self.s1_bands = int(s1_bands)
@@ -841,10 +888,13 @@ class TrainedPipeline:
         self.vector_dim = int(vector_dim)
         self.vector_attr_names = tuple(vector_attr_names)
         self.properties = tuple(cfg.properties)
+        self.text_dim = int(text_dim)
+        self.text_encoder = text_encoder
         self._y_mean = np.asarray(y_mean, dtype=np.float64).copy()
         self._y_std = np.asarray(y_std, dtype=np.float64).copy()
         self._trainable = _PipelineTrainable(
             cfg, s1_bands, s2_bands, vector_dim, n_props=len(self.properties),
+            text_dim=self.text_dim,
         )
 
     # ----------------------- inference -----------------------------------
@@ -854,8 +904,16 @@ class TrainedPipeline:
         s1: np.ndarray,
         s2: np.ndarray,
         vector_features: np.ndarray | None = None,
+        text_features: np.ndarray | None = None,
+        text_missing: float | np.ndarray | None = None,
     ) -> dict[str, float]:
-        """Predict measured properties for one tile's rasters."""
+        """Predict measured properties for one tile's rasters.
+
+        ``text_features`` is optional even on text-aware models — passing
+        ``None`` sets the missingness flag and feeds a zero vector through
+        the projection (graceful degradation matching training-time
+        handling of unaligned rows).
+        """
         import torch
 
         s1_t = torch.from_numpy(np.asarray(s1, dtype=np.float32))
@@ -872,15 +930,22 @@ class TrainedPipeline:
             s1_t = s1_t.unsqueeze(0)
         if s2_t.dim() == 3:
             s2_t = s2_t.unsqueeze(0)
+        text_t, missing_t = self._prepare_text_tensors(
+            text_features, text_missing, batch_size=1,
+        )
         self._trainable.eval()
         with torch.no_grad():
-            standardized = self._trainable.forward(s1_t, s2_t, vec_t).cpu().numpy()[0]
+            standardized = self._trainable.forward(
+                s1_t, s2_t, vec_t, text_t, missing_t,
+            ).cpu().numpy()[0]
         denorm = standardized * self._y_std + self._y_mean
         return {p: float(denorm[i]) for i, p in enumerate(self.properties)}
 
     def predict_batch(
         self, s1: np.ndarray, s2: np.ndarray,
         vector_features: np.ndarray | None = None,
+        text_features: np.ndarray | None = None,
+        text_missing: np.ndarray | None = None,
     ) -> np.ndarray:
         """Predict for a batch — returns shape ``(N, n_props)`` in original units."""
         import torch
@@ -892,15 +957,51 @@ class TrainedPipeline:
             vec_t = torch.zeros(n, self.vector_dim, dtype=torch.float32)
         else:
             vec_t = torch.from_numpy(np.asarray(vector_features, dtype=np.float32))
+        text_t, missing_t = self._prepare_text_tensors(
+            text_features, text_missing, batch_size=n,
+        )
         self._trainable.eval()
         with torch.no_grad():
-            std = self._trainable.forward(s1_t, s2_t, vec_t).cpu().numpy()
+            std = self._trainable.forward(
+                s1_t, s2_t, vec_t, text_t, missing_t,
+            ).cpu().numpy()
         return std * self._y_std[None, :] + self._y_mean[None, :]
+
+    def _prepare_text_tensors(
+        self,
+        text_features: np.ndarray | None,
+        text_missing: float | np.ndarray | None,
+        batch_size: int,
+    ):
+        """Build (text_t, missing_t) for forward(), or (None, None) for non-text models."""
+        import torch
+        if self.text_dim == 0:
+            return None, None
+        if text_features is None:
+            text_t = torch.zeros(batch_size, self.text_dim, dtype=torch.float32)
+            missing_t = torch.ones(batch_size, 1, dtype=torch.float32)
+            return text_t, missing_t
+        tx = np.asarray(text_features, dtype=np.float32)
+        if tx.ndim == 1:
+            tx = tx[None, :]
+        if tx.shape[1] != self.text_dim:
+            raise ValueError(
+                f"text_features dim {tx.shape[1]} != model text_dim {self.text_dim}"
+            )
+        text_t = torch.from_numpy(tx)
+        if text_missing is None:
+            missing_arr = np.zeros((tx.shape[0],), dtype=np.float32)
+        else:
+            missing_arr = np.asarray(text_missing, dtype=np.float32).reshape(-1)
+            if missing_arr.size == 1 and tx.shape[0] > 1:
+                missing_arr = np.broadcast_to(missing_arr, (tx.shape[0],)).copy()
+        missing_t = torch.from_numpy(missing_arr.reshape(-1, 1))
+        return text_t, missing_t
 
     # ----------------------- persistence ---------------------------------
 
     def to_state_dict(self) -> dict:
-        return {
+        out = {
             "schema_version": self.SCHEMA_VERSION,
             "kind": "trained_pipeline",
             "cfg": _trainer_cfg_to_dict(self.cfg),
@@ -914,7 +1015,12 @@ class TrainedPipeline:
             "spectral": self._trainable.spectral_enc.state_dict(),  # type: ignore[attr-defined]
             "fusion": self._trainable.fusion.state_dict(),  # type: ignore[attr-defined]
             "head": self._trainable.head.state_dict(),
+            "text_dim": self.text_dim,
+            "text_encoder": self.text_encoder,
         }
+        if self._trainable.text_projection is not None:
+            out["text_projection"] = self._trainable.text_projection.state_dict()
+        return out
 
     @classmethod
     def from_state_dict(cls, d: dict) -> "TrainedPipeline":
@@ -931,11 +1037,15 @@ class TrainedPipeline:
             y_mean=np.asarray(d["y_mean"], dtype=np.float64),
             y_std=np.asarray(d["y_std"], dtype=np.float64),
             vector_attr_names=tuple(d.get("vector_attr_names", ())),
+            text_dim=int(d.get("text_dim", 0) or 0),
+            text_encoder=d.get("text_encoder"),
         )
         inst._trainable.spatial_enc.load_state_dict(d["spatial"])  # type: ignore[attr-defined]
         inst._trainable.spectral_enc.load_state_dict(d["spectral"])  # type: ignore[attr-defined]
         inst._trainable.fusion.load_state_dict(d["fusion"])  # type: ignore[attr-defined]
         inst._trainable.head.load_state_dict(d["head"])
+        if inst._trainable.text_projection is not None and "text_projection" in d:
+            inst._trainable.text_projection.load_state_dict(d["text_projection"])
         return inst
 
 
@@ -960,6 +1070,7 @@ def _trainer_cfg_to_dict(cfg: PipelineTrainerConfig) -> dict:
         "early_stopping_patience": cfg.early_stopping_patience,
         "warmup_epochs": cfg.warmup_epochs,
         "seed": cfg.seed,
+        "text_projection_dim": cfg.text_projection_dim,
     }
 
 
@@ -987,6 +1098,7 @@ def _trainer_cfg_from_dict(d: dict) -> PipelineTrainerConfig:
         ),
         warmup_epochs=int(d["warmup_epochs"]),
         seed=int(d["seed"]),
+        text_projection_dim=int(d.get("text_projection_dim", 32)),
     )
 
 
@@ -1058,6 +1170,8 @@ def train_pipeline(
         vector_dim=int(examples.n_features_vector),
         y_mean=y_mean, y_std=y_std,
         vector_attr_names=examples.vector_attr_names,
+        text_dim=int(examples.text_dim),
+        text_encoder=examples.text_encoder,
     )
     trainable = model._trainable
     params = list(trainable.parameters())
@@ -1082,6 +1196,14 @@ def train_pipeline(
         vec_t = torch.from_numpy(examples.vector_features.astype(np.float32))
     else:
         vec_t = torch.zeros(len(examples), 0, dtype=torch.float32)
+    if examples.text_dim > 0:
+        text_t = torch.from_numpy(examples.text_features.astype(np.float32))
+        text_missing_t = torch.from_numpy(
+            examples.text_missing.astype(np.float32)
+        ).view(-1, 1)
+    else:
+        text_t = None
+        text_missing_t = None
     y_t = torch.from_numpy(y_norm.astype(np.float32))
     w_t = torch.from_numpy(w.astype(np.float32))
     m_t = torch.from_numpy(mask.astype(np.float32))
@@ -1106,7 +1228,14 @@ def train_pipeline(
         for start in range(0, len(order), cfg.batch_size):
             chunk = order[start : start + cfg.batch_size]
             opt.zero_grad()
-            pred = trainable.forward(s1_t[chunk], s2_t[chunk], vec_t[chunk])
+            text_chunk = text_t[chunk] if text_t is not None else None
+            missing_chunk = (
+                text_missing_t[chunk] if text_missing_t is not None else None
+            )
+            pred = trainable.forward(
+                s1_t[chunk], s2_t[chunk], vec_t[chunk],
+                text_chunk, missing_chunk,
+            )
             diff = pred - y_t[chunk]
             sq = diff * diff
             weighted = sq * w_t[chunk] * m_t[chunk]
@@ -1126,7 +1255,13 @@ def train_pipeline(
             trainable.eval()
             with torch.no_grad():
                 idx = splits.val
-                pred = trainable.forward(s1_t[idx], s2_t[idx], vec_t[idx])
+                text_val = text_t[idx] if text_t is not None else None
+                missing_val = (
+                    text_missing_t[idx] if text_missing_t is not None else None
+                )
+                pred = trainable.forward(
+                    s1_t[idx], s2_t[idx], vec_t[idx], text_val, missing_val,
+                )
                 diff = pred - y_t[idx]
                 weighted = diff * diff * w_t[idx] * m_t[idx]
                 denom = (w_t[idx] * m_t[idx]).sum().clamp_min(1e-9)
@@ -1170,7 +1305,13 @@ def evaluate(
         examples.vector_features[idx]
         if examples.n_features_vector > 0 else None
     )
-    pred = model.predict_batch(s1, s2, vec)  # (N, n_props)
+    if examples.text_dim > 0:
+        text = examples.text_features[idx]
+        missing = examples.text_missing[idx]
+    else:
+        text = None
+        missing = None
+    pred = model.predict_batch(s1, s2, vec, text, missing)  # (N, n_props)
     out: dict[str, Metrics] = {}
     for i, p in enumerate(model.properties):
         y = examples.y[p][idx]

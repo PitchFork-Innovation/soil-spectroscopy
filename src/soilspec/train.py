@@ -23,9 +23,11 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from .groundtruth import (
     GroundTruthDataset, ISMNAdapter, ISMNArchiveAdapter,
-    LUCASAdapter, SoilGridsAdapter, TileGrid,
+    LUCASAdapter, SoilGridsAdapter, TextRecord, TileGrid,
     assemble_raster_examples,
 )
 from .ingestion import AdapterRegistry, Ingestion, MetadataParser
@@ -87,6 +89,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lucas-csv", type=Path, default=None,
                    help="optional LUCAS CSV (already normalized via "
                         "normalize_lucas_esdac_csv)")
+    p.add_argument("--text-npz", type=Path, default=None,
+                   help="optional .npz with precomputed text embeddings "
+                        "aligned to tiles. Required arrays: 'tile_ids' "
+                        "(N str), 'times' (N int64), 'embeddings' (N, D). "
+                        "Optional: 'doc_ids' (N str), 'encoder' (0-d str).")
+    p.add_argument("--text-encoder", type=str, default=None,
+                   help="override the encoder identifier from --text-npz")
+    p.add_argument("--text-projection-dim", type=int, default=32,
+                   help="output width of the trainable text projection layer")
     p.add_argument("--out", required=True, type=_parse_out,
                    help="output model key 'family:version'")
     p.add_argument("--epochs", type=int, default=200)
@@ -118,6 +129,40 @@ def _build_gt_dataset(
     if args.lucas_csv is not None:
         ds.extend(LUCASAdapter(csv_path=args.lucas_csv).fetch(aoi, window))
     return ds
+
+
+def _load_text_records(
+    args: argparse.Namespace,
+) -> tuple[list[TextRecord] | None, str | None]:
+    """Load precomputed text embeddings from --text-npz, if supplied.
+
+    Returns ``(text_records, encoder_id)`` or ``(None, None)`` when the
+    flag is absent — preserving the two-modality default.
+    """
+    if args.text_npz is None:
+        return None, None
+    path = Path(args.text_npz)
+    if not path.exists():
+        raise FileNotFoundError(f"--text-npz not found: {path}")
+    data = np.load(path, allow_pickle=False)
+    tile_ids = data["tile_ids"]
+    times = data["times"]
+    embeddings = data["embeddings"]
+    doc_ids = data["doc_ids"] if "doc_ids" in data.files else [""] * len(tile_ids)
+    npz_encoder = (
+        str(data["encoder"]) if "encoder" in data.files else ""
+    )
+    encoder = args.text_encoder or npz_encoder or None
+    records = [
+        TextRecord(
+            tile_id=str(tile_ids[i]), time=int(times[i]),
+            embedding=np.asarray(embeddings[i], dtype=np.float32),
+            doc_id=str(doc_ids[i]),
+            encoder=encoder or "",
+        )
+        for i in range(len(tile_ids))
+    ]
+    return records, encoder
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,11 +197,18 @@ def main(argv: list[str] | None = None) -> int:
     n_samples = sum(1 for _ in gt.samples())
     print(f"[train] {n_samples} aggregated GT samples (dropped={gt.dropped} out of AOI).")
 
+    text_records, text_encoder = _load_text_records(args)
+
     examples = assemble_raster_examples(
         records, gt, property_names=args.properties or MEASURED_PROPERTY_NAMES,
+        text_records=text_records, text_encoder=text_encoder,
     )
     print(f"[train] {len(examples)} (raster, label) training rows; "
           f"sources={examples.sources}; vector_attrs={examples.vector_attr_names}")
+    if examples.text_dim > 0:
+        n_text = int(np.sum(examples.text_missing == 0.0))
+        print(f"[train] text: dim={examples.text_dim} encoder={examples.text_encoder} "
+              f"aligned={n_text}/{len(examples)}")
     if len(examples) == 0:
         print("[train] no usable rows — check that GT samples align with "
               "tiles produced by the preprocessor.")
@@ -182,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
         seed=args.seed,
+        text_projection_dim=args.text_projection_dim,
     )
     print(f"[train] fitting (epochs={trainer_cfg.epochs}, "
           f"batch={trainer_cfg.batch_size}, lr={trainer_cfg.learning_rate})...")
