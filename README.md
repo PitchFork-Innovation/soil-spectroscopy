@@ -1,10 +1,5 @@
 # soil-spectroscopy
 
-Reference implementation of the multimodal remote sensing pipeline described
-in PRD #1: ingest Sentinel-1/Sentinel-2/vector observations for an AOI, derive
-soil functional properties (SMI, infiltration potential, erosion
-susceptibility), and publish land capability classifications + management
-recommendations as map layers — without in-situ sampling.
 
 ## Layout
 
