@@ -13,10 +13,23 @@ publish numbers as a baseline for the retry/expansion follow-on.
 PRODUCTION NOTE — chemistry heads are training-only auxiliaries
 ----------------------------------------------------------------
 On the v2 dataset (521 rows, 45 AOIs) only the **soil_moisture** head beats
-baseline on a spatially-blocked test split (R²=+0.082). SOC / N / P / K /
-ph heads do not generalise across AOIs at this dataset size; S1+S2 alone
-appears to carry too little chemistry signal for spatial-block extrapolation
-to work.
+baseline on a spatially-blocked test split. Three trained variants exist,
+all with seed=0, the same 327/112/82 split, and patience-30 early stopping:
+
+* no text (``initial_v2.pkl``): soil_moisture R²=+0.082; chemistry heads
+  all negative.
+* hash text (``initial_v2_text.pkl``): soil_moisture R²=−0.441 (worse);
+  K and ph showed gains (R²=+0.442, +0.414) but those are spurious — a
+  per-tile fingerprint from the deterministic hash encoder that didn't
+  transfer past the held-out boundary in a useful sense.
+* MiniLM text (``initial_v2_text_minilm.pkl``): **soil_moisture R²=+0.268**
+  (3.3× lift over no-text); chemistry heads still negative.
+
+The MiniLM model is the current production reference for soil_moisture.
+
+SOC / N / P / K / ph heads do not generalise across AOIs at this dataset
+size regardless of text — S1+S2+text together still appear to carry too
+little chemistry signal for spatial-block extrapolation to work.
 
 That said, training with all six properties produces a *better*
 soil_moisture head than training with soil_moisture alone (R²=+0.082 vs
@@ -30,11 +43,18 @@ chemistry heads can be left in the model artifact but should not be
 surfaced to downstream consumers until per-source dataset coverage is
 large enough to make those heads generalise.
 
-Run::
+Run (current production: MiniLM text)::
+
+    python -m soilspec.datasets.build_text \\
+        --ismn-csv data/groundtruth/ismn_2023.csv \\
+        --lucas-csv data/groundtruth/lucas_2018_topsoil.csv \\
+        --encoder st:all-MiniLM-L6-v2 --time-strategy daily \\
+        --out data/text_corpora/initial_v2_minilm_daily.npz
 
     python -m soilspec.datasets.train_initial \\
         --dataset data/trainsets/initial_v2.pkl \\
-        --output data/models/initial_v2.pkl
+        --output data/models/initial_v2_text_minilm.pkl \\
+        --text-npz data/text_corpora/initial_v2_minilm_daily.npz
 """
 
 from __future__ import annotations
